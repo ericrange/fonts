@@ -21,7 +21,7 @@ flags.DEFINE_boolean('check_metadata', True, 'Whether to check METADATA values')
 flags.DEFINE_boolean('check_font', True, 'Whether to check font values')
 flags.DEFINE_string('repair_script', None, 'Where to write a repair script')
 _FIX_TYPE_OPTS = ['all', 'name', 'filename', 'postScriptName', 'fullName',
-                  'fsSelection', 'fsType', 'usWeightClass']
+                  'fsSelection', 'fsType', 'usWeightClass', 'emptyGlyphLSB']
 flags.DEFINE_multistring('fix_type', 'all',
                          'What types of problems should be fixed by '
                          'repair_script. Choices: ' + ', '.join(_FIX_TYPE_OPTS))
@@ -59,14 +59,14 @@ def _SanityCheck(path):
   """Runs various sanity checks on the font family under path.
 
   Args:
-    path: A directory containing a METADATA.json file.
+    path: A directory containing a METADATA.pb file.
   Returns:
     A list of ResultMessageTuple's.
   """
   try:
     fonts.Metadata(path)
   except ValueError as e:
-    return [_SadResult('Bad METADATA.json: ' + e.message, path)]
+    return [_SadResult('Bad METADATA.pb: ' + e.message, path)]
 
   results = []
   if FLAGS.check_metadata:
@@ -80,17 +80,17 @@ def _SanityCheck(path):
 
 
 def _CheckLicense(path):
-  """Verifies that METADATA.json license is correct under path.
+  """Verifies that METADATA.pb license is correct under path.
 
-  Assumes path is of the form .../<license>/<whatever>/METADATA.json.
+  Assumes path is of the form .../<license>/<whatever>/METADATA.pb.
 
   Args:
-    path: A directory containing a METADATA.json file.
+    path: A directory containing a METADATA.pb file.
   Returns:
     A list with one ResultMessageTuple. If happy, license is good.
   """
   metadata = fonts.Metadata(path)
-  lic = metadata['license']
+  lic = metadata.license
   lic_dir = os.path.basename(os.path.dirname(path))
 
   # We use /apache for the license Apache2
@@ -107,31 +107,31 @@ def _CheckLicense(path):
 
 
 def _CheckNameMatching(path):
-  """Verifies the various name fields in the METADATA.json file are sane.
+  """Verifies the various name fields in the METADATA.pb file are sane.
 
   Args:
-    path: A directory containing a METADATA.json file.
+    path: A directory containing a METADATA.pb file.
   Returns:
     A list of ResultMessageTuple, one per validation performed.
   """
   results = []
   metadata = fonts.Metadata(path)
-  name = metadata['name']
+  name = metadata.name
 
-  for font in metadata['fonts']:
+  for font in metadata.fonts:
     # We assume style/weight is correct in METADATA
-    style = font['style']
-    weight = font['weight']
-    correct_values = {
-        'name': name,
-        'filename': fonts.FilenameFor(name, style, weight, '.ttf'),
-        'postScriptName': fonts.FilenameFor(name, style, weight),
-        'fullName': fonts.FullnameFor(name, style, weight)
-    }
+    style = font.style
+    weight = font.weight
+    values = [
+        ('name', name, font.name),
+        ('filename', fonts.FilenameFor(name, style, weight, '.ttf'),
+         font.filename),
+        ('postScriptName', fonts.FilenameFor(name, style, weight),
+         font.post_script_name),
+        ('fullName', fonts.FullnameFor(name, style, weight), font.full_name)
+    ]
 
-    for key in correct_values:
-      expected = correct_values[key]
-      actual = font[key]
+    for (key, expected, actual) in values:
       if expected != actual:
         results.append(_SadResult(
             '%s METADATA %s/%d %s expected %s, got %s' %
@@ -174,9 +174,10 @@ def _FixMetadata(style, weight, key, expected):
   if not isinstance(expected, int):
     expected = '\'%s\'' % expected
 
-  return ('[f for f in metadata[\'fonts\'] if f[\'style\'] == \'%s\' '
-          'and f[\'weight\'] == %d][0][\'%s\'] = %s') % (
-              style, weight, key, expected)
+  return ('[f for f in metadata.fonts if f.style == \'%s\' '
+          'and f.weight == %d][0].%s = %s') % (
+              style, weight, re.sub('([a-z])([A-Z])', r'\1_\2', key)
+              .lower(), expected)
 
 
 def _FixFsSelectionBit(key, expected):
@@ -237,6 +238,14 @@ def _FixMissingNameRecord(friendly_name, name_id, expected):
               name_id, friendly_name, expected))
 
 
+def _FixEmptyGlyphLsb(glyph_name):
+  if not _ShouldFix('emptyGlyphLSB'):
+    return None
+
+  return 'ttf[\'hmtx\'][\'%s\'] = [ttf[\'hmtx\'][\'%s\'][0], 0]\n' % (
+      glyph_name, glyph_name)
+
+
 def _CheckFontOS2Values(path, font, ttf):
   """Check sanity of values hidden in the 'OS/2' table.
 
@@ -244,17 +253,17 @@ def _CheckFontOS2Values(path, font, ttf):
 
   Args:
     path: Path to directory containing font.
-    font: A font record from a METADATA.json.
+    font: A font record from a METADATA.pb.
     ttf: A fontTools.ttLib.TTFont for the font.
   Returns:
     A list of ResultMessageTuple for tests performed.
   """
   results = []
 
-  font_file = font['filename']
+  font_file = font.filename
   full_font_file = os.path.join(path, font_file)
-  expected_style = font['style']
-  expected_weight = font['weight']
+  expected_style = font.style
+  expected_weight = font.weight
 
   os2 = ttf['OS/2']
   fs_selection_flags = fonts.FsSelectionFlags(os2.fsSelection)
@@ -265,7 +274,6 @@ def _CheckFontOS2Values(path, font, ttf):
   marked_italic = 'ITALIC' in fs_selection_flags
   marked_bold = 'BOLD' in fs_selection_flags
 
-  # fsSelection flags (see thread http://shortn/_FEOPPU691a)
   expect_italic = _IsItalic(expected_style)
   expect_bold = _IsBold(expected_weight)
   # Per Dave C, we should NEVER set oblique, use 0 for italic
@@ -288,13 +296,13 @@ def _CheckFontOS2Values(path, font, ttf):
           font_file, expected_style, expected_weight, marked_oblique),
       full_font_file, _FixFsSelectionBit('OBLIQUE', expect_oblique)))
 
-  # For weight < 300, just confirm 250<weight<300
+  # For weight < 300, just confirm weight [250, 300)
   # TODO(user): we should also verify ordering is correct
   weight_ok = expected_weight == actual_weight
   weight_msg = str(expected_weight)
   if expected_weight < 300:
-    weight_ok = actual_weight > 250 and actual_weight < 300
-    weight_msg = '(250, 300)'
+    weight_ok = actual_weight >= 250 and actual_weight < 300
+    weight_msg = '[250, 300)'
 
   results.append(ResultMessageTuple(
       weight_ok,
@@ -320,16 +328,16 @@ def _CheckFontNameValues(path, name, font, ttf):
   Args:
     path: Path to directory containing font.
     name: The name of the family.
-    font: A font record from a METADATA.json.
+    font: A font record from a METADATA.pb.
     ttf: A fontTools.ttLib.TTFont for the font.
   Returns:
     A list of ResultMessageTuple for tests performed.
   """
   results = []
 
-  style = font['style']
-  weight = font['weight']
-  full_font_file = os.path.join(path, font['filename'])
+  style = font.style
+  weight = font.weight
+  full_font_file = os.path.join(path, font.filename)
 
   expectations = [
       ('family', fonts.NAME_FAMILY, name),
@@ -358,26 +366,53 @@ def _CheckFontNameValues(path, name, font, ttf):
   return results
 
 
+def _CheckLSB0ForEmptyGlyphs(path, font, ttf):
+  """Checks if font has empty (loca[n] == loca[n+1]) glyphs that have non-0 lsb.
+
+  There is no reason to set such lsb's.
+
+  Args:
+    path: Path to directory containing font.
+    font: A font record from a METADATA.pb.
+    ttf: A fontTools.ttLib.TTFont for the font.
+  Returns:
+    A list of ResultMessageTuple for tests performed.
+  """
+  results = []
+  if 'loca' not in ttf:
+    return results
+  for glyph_index, glyph_name in enumerate(ttf.getGlyphOrder()):
+    is_empty = ttf['loca'][glyph_index] == ttf['loca'][glyph_index + 1]
+    lsb = ttf['hmtx'][glyph_name][1]
+    if is_empty and lsb != 0:
+      results.append(_SadResult(
+          '%s %s/%d [\'hmtx\'][\'%s\'][1] (lsb) should be 0 but is %d' %
+          (font.name, font.style, font.weight, glyph_name, lsb),
+          os.path.join(path, font.filename), _FixEmptyGlyphLsb(glyph_name)))
+  return results
+
+
 def _CheckFontInternalValues(path):
-  """Validates fonts internal metadata matches METADATA.json values.
+  """Validates fonts internal metadata matches METADATA.pb values.
 
   In particular, checks 'OS/2' {usWeightClass, fsSelection, fsType} and 'name'
   {fullName, postScriptName} values.
 
   Args:
-    path: A directory containing a METADATA.json file.
+    path: A directory containing a METADATA.pb file.
   Returns:
     A list of ResultMessageTuple, one per validation performed.
   """
   results = []
   metadata = fonts.Metadata(path)
-  name = metadata['name']
+  name = metadata.name
 
-  for font in metadata['fonts']:
-    font_file = font['filename']
+  for font in metadata.fonts:
+    font_file = font.filename
     with contextlib.closing(ttLib.TTFont(os.path.join(path, font_file))) as ttf:
       results.extend(_CheckFontOS2Values(path, font, ttf))
       results.extend(_CheckFontNameValues(path, name, font, ttf))
+      results.extend(_CheckLSB0ForEmptyGlyphs(path, font, ttf))
 
   return results
 
@@ -388,9 +423,11 @@ def _WriteRepairScript(dest_file, results):
   with open(dest_file, 'w') as out:
     out.write('import collections\n')
     out.write('import contextlib\n')
-    out.write('import json\n')
-    out.write('import re\n')
     out.write('from fontTools import ttLib\n')
+    out.write('from google.protobuf.text_format import text_format\n')
+    out.write('from fonts_public_pb2 import fonts_pb2\n')
+    out.write('from fonts_public_pb2 '
+              'import fonts_metadata_pb2\n')
     out.write('\n')
 
     # group by path
@@ -412,10 +449,10 @@ def _WriteRepairScript(dest_file, results):
         out.write('with contextlib.closing(ttLib.TTFont(\'%s\')) as ttf:\n'
                   % path)
       elif os.path.isdir(path):
-        metadata_file = os.path.join(path, 'METADATA.json')
+        metadata_file = os.path.join(path, 'METADATA.pb')
+        out.write('metadata = fonts_pb2.FamilyProto()\n')
         out.write('with open(\'%s\', \'r\') as f:\n' % metadata_file)
-        out.write('  metadata = json.load(f, '
-                  'object_pairs_hook=collections.OrderedDict)\n')
+        out.write('  text_format.Merge(f.read(), metadata)\n')
       else:
         raise ValueError('Not sure how to script %s' % path)
 
@@ -429,10 +466,7 @@ def _WriteRepairScript(dest_file, results):
 
       if os.path.isdir(path):
         out.write('with open(\'%s\', \'w\') as f:\n' % metadata_file)
-        # pylint: disable=anomalous-backslash-in-string
-        out.write('  f.write(re.sub(r\'\s+\\n\', \'\\n\', '
-                  'json.dumps(metadata, indent=2)))\n')
-        # pylint: enable=anomalous-backslash-in-string
+        out.write('  f.write(text_format.MessageToString(metadata))\n')
 
       out.write('\n')
 
